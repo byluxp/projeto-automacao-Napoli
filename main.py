@@ -1,15 +1,21 @@
 from __future__ import annotations
 
-import re
-import unicodedata
 from pathlib import Path
 
-import pandas as pd
 import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+import pandas as pd
 
-from src.utils import selecionar_arquivo_cliente, gerar_caminho_saida_versionado
+from src.utils import (
+    selecionar_arquivo_cliente,
+    gerar_caminho_saida_versionado,
+    ensure_processed_dir,
+    load_excel_file,
+    prepare_client_dataframe,
+    prepare_master_dataframe,
+    classify_similarity,
+    carregar_dicionario_sinonimos,
+    calcular_matriz_similaridade_ponderada,
+)
 
 # -----------------------------------------------------------------------------
 # Configuração dos caminhos do projeto
@@ -19,159 +25,22 @@ DIR_RAW = BASE_DIR / "data" / "01_raw"
 DIR_MASTER = BASE_DIR / "data" / "02_master"
 DIR_PROCESSED = BASE_DIR / "data" / "03_processed"
 
-ARQUIVO_CPU = DIR_MASTER / "listaCod.xlsx"
-
-# -----------------------------------------------------------------------------
-# Funções utilitárias
-# -----------------------------------------------------------------------------
-def normalize_text(value):
-    """Converte texto para lowercase, remove acentos, pontuação e espaços extras."""
-    if pd.isna(value):
-        return ""
-
-    text = str(value).strip().lower()
-    text = unicodedata.normalize("NFKD", text)
-    text = "".join(ch for ch in text if not unicodedata.combining(ch))
-    text = re.sub(r"[^a-z0-9\s]", " ", text, flags=re.UNICODE)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-
-def find_column(columns, aliases):
-    """Busca uma coluna por lista de nomes esperados, ignorando acentos e maiúsculas."""
-    normalized_columns = {normalize_text(col): col for col in columns}
-    for alias in aliases:
-        key = normalize_text(alias)
-        if key in normalized_columns:
-            return normalized_columns[key]
-    return None
-
-
-def ensure_processed_dir():
-    """Cria a pasta de arquivos processados caso não exista."""
-    DIR_PROCESSED.mkdir(parents=True, exist_ok=True)
-    print(f"[INFO] Diretório de saída confirmado: {DIR_PROCESSED}")
+ARQUIVO_CPU = DIR_MASTER / "lista_cod_main.xlsx"
+ARQUIVO_DICIONARIO_SINONIMOS = DIR_MASTER / "dicionario_sinonimos" / "dicionario_sinonimo_1.0.xlsx"
 
 
 # -----------------------------------------------------------------------------
-# Carregamento e validação dos arquivos
+# Mapeamento automático por similaridade ponderada (caracteres + sinônimos)
 # -----------------------------------------------------------------------------
-def load_excel_file(file_path: Path, label: str) -> pd.DataFrame:
-    """Carrega uma planilha Excel e valida a existência do arquivo."""
-    if not file_path.exists():
-        raise FileNotFoundError(f"Arquivo de {label} não encontrado: {file_path}")
-
-    print(f"[INFO] Carregando {label}: {file_path}")
-    return pd.read_excel(file_path)
-
-
-# -----------------------------------------------------------------------------
-# Preparação dos dados do cliente e do catálogo mestre
-# -----------------------------------------------------------------------------
-def prepare_client_dataframe(df_cliente: pd.DataFrame) -> pd.DataFrame:
-    """Padroniza o DataFrame do cliente para o processamento de automação."""
-    print("[INFO] Preparando dados do cliente...")
-
-    codigo_col_cliente = find_column(df_cliente.columns, ["codigo", "código", "Código", "Codigo", "cod", "cod_servico"])
-    if codigo_col_cliente is None:
-        codigo_col_cliente = "Código"
-        df_cliente.insert(0, codigo_col_cliente, "")
-    else:
-        df_cliente[codigo_col_cliente] = ""
-
-    descricao_col_cliente = find_column(
-        df_cliente.columns,
-        [
-            "descricao dos servicos",
-            "descrição dos serviços",
-            "descricao",
-            "descrição",
-            "servico",
-            "item",
-            "descricao do servico",
-        ],
-    )
-    if descricao_col_cliente is None:
-        raise ValueError("Não foi possível localizar a coluna de descrição dos serviços no arquivo do cliente.")
-
-    qtd_col_cliente = find_column(df_cliente.columns, ["quantidade", "qtde", "qtd", "quant"])
-    unidade_col_cliente = find_column(df_cliente.columns, ["unidade", "unid", "umed", "um"])
-
-    df_cliente = df_cliente.copy()
-    df_cliente["_descricao_normalizada"] = df_cliente[descricao_col_cliente].map(normalize_text)
-
-    if qtd_col_cliente is not None:
-        df_cliente["_quantidade_limpa"] = df_cliente[qtd_col_cliente].fillna("").astype(str).str.strip()
-    else:
-        df_cliente["_quantidade_limpa"] = ""
-
-    if unidade_col_cliente is not None:
-        df_cliente["_unidade_limpa"] = df_cliente[unidade_col_cliente].fillna("").astype(str).str.strip()
-    else:
-        df_cliente["_unidade_limpa"] = ""
-
-    df_cliente["_is_agrupador"] = (
-        df_cliente["_quantidade_limpa"].eq("") & df_cliente["_unidade_limpa"].eq("")
-    )
-
-    return {
-        "df": df_cliente,
-        "codigo_col": codigo_col_cliente,
-        "descricao_col": descricao_col_cliente,
-        "qtd_col": qtd_col_cliente,
-        "unidade_col": unidade_col_cliente,
-    }
-
-
-def prepare_master_dataframe(df_master: pd.DataFrame) -> dict:
-    """Padroniza o DataFrame do catálogo mestre CPU para comparação por similaridade."""
-    print("[INFO] Preparando base mestre CPU...")
-
-    codigo_col_master = find_column(df_master.columns, ["codigo", "Código", "código", "Codigo", "cod", "cod_servico", "codigo_do_servico"])
-    if codigo_col_master is None:
-        raise ValueError("Não foi possível localizar a coluna de código no catálogo mestre CPU.")
-
-    descricao_col_master = find_column(
-        df_master.columns,
-        [
-            "descricao completa",
-            "descrição completa",
-            "descricao",
-            "descrição",
-            "descricao do servico",
-            "descrição do serviço",
-            "servico",
-        ],
-    )
-    if descricao_col_master is None:
-        raise ValueError("Não foi possível localizar a coluna de descrição completa no catálogo mestre CPU.")
-
-    df_master = df_master.copy()
-    df_master["_descricao_normalizada"] = df_master[descricao_col_master].map(normalize_text)
-    df_master = df_master[df_master["_descricao_normalizada"].str.len() > 0].copy()
-
-    return {
-        "df": df_master,
-        "codigo_col": codigo_col_master,
-        "descricao_col": descricao_col_master,
-    }
-
-
-# -----------------------------------------------------------------------------
-# Mapeamento automático por similaridade TF-IDF
-# -----------------------------------------------------------------------------
-def classify_similarity(score: float) -> str:
-    """Define o status de automação pela taxa de similaridade."""
-    if score >= 0.68:
-        return "Alto Grau de Confiança"
-    if score >= 0.50:
-        return "Revisão Recomendada"
-    return "Baixa Similaridade"
-
-
-def process_similarity_mapping(df_cliente: pd.DataFrame, df_master: pd.DataFrame, cliente_meta: dict, master_meta: dict):
-    """Compara descrições do cliente com a base master usando TF-IDF com n-grams por caracteres."""
-    print("[INFO] Executando comparação por similaridade TF-IDF...")
+def process_similarity_mapping(
+    df_cliente: pd.DataFrame,
+    df_master: pd.DataFrame,
+    cliente_meta: dict,
+    master_meta: dict,
+    mapa_sinonimos: dict,
+):
+    """Compara descrições do cliente com a base master usando similaridade ponderada por sinônimos."""
+    print("[INFO] Executando comparação por similaridade ponderada...")
 
     cliente_desc = df_cliente.loc[~df_cliente["_is_agrupador"], "_descricao_normalizada"]
     master_desc = df_master["_descricao_normalizada"]
@@ -183,11 +52,7 @@ def process_similarity_mapping(df_cliente: pd.DataFrame, df_master: pd.DataFrame
     if master_desc.empty:
         raise ValueError("A base mestre CPU está vazia após a limpeza de descrições. Verifique a planilha de catálogo.")
 
-    vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), lowercase=False)
-    matriz_master = vectorizer.fit_transform(master_desc)
-    matriz_cliente = vectorizer.transform(cliente_desc)
-
-    semelhancas = cosine_similarity(matriz_cliente, matriz_master)
+    semelhancas = calcular_matriz_similaridade_ponderada(cliente_desc, master_desc, mapa_sinonimos)
     melhor_idx = semelhancas.argmax(axis=1)
     melhor_score = semelhancas[np.arange(len(semelhancas)), melhor_idx]
 
@@ -202,6 +67,75 @@ def process_similarity_mapping(df_cliente: pd.DataFrame, df_master: pd.DataFrame
         df_cliente.at[pos_original, "Descrição_Mestre_Encontrada"] = descricao_mestre
         df_cliente.at[pos_original, "Similaridade_Pct"] = round(score * 100, 2)
         df_cliente.at[pos_original, "Status_Automacao"] = classify_similarity(score)
+
+    return df_cliente
+
+
+def carregar_bases_master_lista_cod(dir_master: Path) -> pd.DataFrame:
+    """Carrega e combina todos os arquivos 'lista_cod*' da pasta master em uma única base de comparação."""
+    arquivos_master = sorted(
+        p for p in dir_master.glob("lista_cod*")
+        if p.is_file() and p.suffix.lower() in {".xlsx", ".xls"}
+    )
+
+    frames_master = []
+    for arquivo in arquivos_master:
+        df_master_arquivo = load_excel_file(arquivo, f"CPU ({arquivo.name})")
+        master_meta_arquivo = prepare_master_dataframe(df_master_arquivo)
+        df_padronizado = master_meta_arquivo["df"][["_descricao_normalizada"]].copy()
+        df_padronizado["_codigo"] = master_meta_arquivo["df"][master_meta_arquivo["codigo_col"]]
+        df_padronizado["_descricao"] = master_meta_arquivo["df"][master_meta_arquivo["descricao_col"]]
+        frames_master.append(df_padronizado)
+
+    if not frames_master:
+        return pd.DataFrame(columns=["_descricao_normalizada", "_codigo", "_descricao"])
+
+    return pd.concat(frames_master, ignore_index=True)
+
+
+def process_aux_similarity_mapping(df_cliente: pd.DataFrame, cliente_meta: dict, mapa_sinonimos: dict) -> pd.DataFrame:
+    """Reavalia itens com baixa similaridade/revisão recomendada buscando a melhor similaridade entre
+    todos os arquivos 'lista_cod*' da pasta master de uma só vez (sem repassar arquivo por arquivo)."""
+    print("[INFO] Executando busca complementar combinando todos os arquivos lista_cod* da pasta master...")
+
+    mask_revisao = df_cliente["Status_Automacao"].isin(["Baixa Similaridade", "Revisão Recomendada"])
+    if not mask_revisao.any():
+        return df_cliente
+
+    # Remove o código sugerido pela base principal para os itens que serão reavaliados.
+    df_cliente.loc[mask_revisao, cliente_meta["codigo_col"]] = ""
+
+    df_master_combinado = carregar_bases_master_lista_cod(DIR_MASTER)
+    master_desc = df_master_combinado["_descricao_normalizada"]
+    cliente_desc = df_cliente.loc[mask_revisao, "_descricao_normalizada"]
+
+    if master_desc.empty:
+        print(f"[AVISO] Nenhum arquivo lista_cod* encontrado em: {DIR_MASTER}. Etapa de busca complementar ignorada.")
+        return df_cliente
+
+    if cliente_desc.empty:
+        return df_cliente
+
+    semelhancas = calcular_matriz_similaridade_ponderada(cliente_desc, master_desc, mapa_sinonimos)
+    melhor_idx = semelhancas.argmax(axis=1)
+    melhor_score = semelhancas[np.arange(len(semelhancas)), melhor_idx]
+
+    for idx_pos, pos_original in enumerate(df_cliente.index[mask_revisao]):
+        score = float(melhor_score[idx_pos])
+        melhor_master_idx = int(melhor_idx[idx_pos])
+
+        codigo_encontrado = df_master_combinado.iloc[melhor_master_idx]["_codigo"]
+        descricao_encontrada = df_master_combinado.iloc[melhor_master_idx]["_descricao"]
+
+        df_cliente.at[pos_original, "Similaridade_Pct"] = round(score * 100, 2)
+        df_cliente.at[pos_original, "Descrição_Mestre_Encontrada"] = descricao_encontrada
+
+        if score >= 0.50:
+            df_cliente.at[pos_original, cliente_meta["codigo_col"]] = codigo_encontrado
+            df_cliente.at[pos_original, "Status_Automacao"] = "Encontrado na Base Auxiliar"
+        else:
+            df_cliente.at[pos_original, cliente_meta["codigo_col"]] = ""
+            df_cliente.at[pos_original, "Status_Automacao"] = "Não Encontrado - Baixa Similaridade"
 
     return df_cliente
 
@@ -230,6 +164,8 @@ def build_executive_report(df_cliente: pd.DataFrame) -> pd.DataFrame:
         "Alto Grau de Confiança",
         "Revisão Recomendada",
         "Baixa Similaridade",
+        "Encontrado na Base Auxiliar",
+        "Não Encontrado - Baixa Similaridade",
         "Agrupador / Cabeçalho",
     ]
 
@@ -269,6 +205,8 @@ def print_dashboard(df_cliente: pd.DataFrame):
         "Alto Grau de Confiança",
         "Revisão Recomendada",
         "Baixa Similaridade",
+        "Encontrado na Base Auxiliar",
+        "Não Encontrado - Baixa Similaridade",
         "Agrupador / Cabeçalho",
     ]
     for status in status_order:
@@ -296,7 +234,8 @@ def export_excel_with_report(df_cliente: pd.DataFrame, output_path: Path):
 def main():
     """Fluxo principal da automação de mapeamento de códigos de serviços."""
     print("\n=== INÍCIO DA AUTOMATIZAÇÃO ===")
-    ensure_processed_dir()
+    ensure_processed_dir(DIR_PROCESSED)
+    mapa_sinonimos = carregar_dicionario_sinonimos(ARQUIVO_DICIONARIO_SINONIMOS)
 
     try:
         arquivo_cliente = selecionar_arquivo_cliente(DIR_RAW)
@@ -333,7 +272,8 @@ def main():
             df_cliente.at[idx, "Similaridade_Pct"] = 0.0
             df_cliente.at[idx, "Status_Automacao"] = "Agrupador / Cabeçalho"
 
-        df_cliente = process_similarity_mapping(df_cliente, df_master, cliente_meta, master_meta)
+        df_cliente = process_similarity_mapping(df_cliente, df_master, cliente_meta, master_meta, mapa_sinonimos)
+        df_cliente = process_aux_similarity_mapping(df_cliente, cliente_meta, mapa_sinonimos)
 
         # Garantindo que linhas agrupadoras permaneçam com código vazio e sem busca executada.
         for idx in df_cliente.index[df_cliente["_is_agrupador"]]:
