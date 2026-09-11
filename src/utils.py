@@ -217,6 +217,59 @@ def calcular_matriz_similaridade_ponderada(
     return (peso_sinonimos * similaridade_sinonimos) + (peso_caracteres * similaridade_caracteres)
 
 
+# -----------------------------------------------------------------------------
+# Falsos amigos: penalização de termos parecidos na escrita mas com sentidos diferentes
+# -----------------------------------------------------------------------------
+def carregar_falsos_amigos(caminho_falsos_amigos: Path) -> dict:
+    """Carrega a planilha de falsos amigos e mapeia cada par de termos ao peso de penalização já atribuído nela."""
+    if not caminho_falsos_amigos.exists():
+        print(f"[AVISO] Arquivo de falsos amigos não encontrado: {caminho_falsos_amigos}. Penalização desativada.")
+        return {}
+
+    df_falsos_amigos = pd.read_excel(caminho_falsos_amigos)
+
+    mapa_falsos_amigos: dict = {}
+    for _, linha in df_falsos_amigos.iterrows():
+        termo1 = normalize_text(linha.get("Termo 1"))
+        termo2 = normalize_text(linha.get("Termo 2"))
+        peso = linha.get("Similaridade")
+        if not termo1 or not termo2 or pd.isna(peso):
+            continue
+        mapa_falsos_amigos[frozenset((termo1, termo2))] = float(peso)
+
+    return mapa_falsos_amigos
+
+
+def aplicar_penalidade_falsos_amigos(
+    descricao_origem_normalizada: str,
+    descricao_master_normalizada: str,
+    mapa_falsos_amigos: dict,
+    score: float,
+) -> float:
+    """Reduz o score quando a descrição de origem e a do master encontrada contêm um par de termos marcado
+    como falso amigo (ex.: 'rede' x 'parede'), usando o peso já atribuído para essa dupla na planilha."""
+    if not mapa_falsos_amigos:
+        return score
+
+    palavras_origem = set(descricao_origem_normalizada.split())
+    palavras_master = set(descricao_master_normalizada.split())
+
+    penalidade_maxima = 0.0
+    for par, peso in mapa_falsos_amigos.items():
+        termo1, termo2 = tuple(par)
+        termos_cruzados = (
+            (termo1 in palavras_origem and termo2 in palavras_master)
+            or (termo2 in palavras_origem and termo1 in palavras_master)
+        )
+        if termos_cruzados:
+            penalidade_maxima = max(penalidade_maxima, peso)
+
+    if penalidade_maxima <= 0:
+        return score
+
+    return score * (1 - penalidade_maxima)
+
+
 def selecionar_arquivo_cliente(diretorio_raw: Path) -> Path:
     """Lista os arquivos em 01_raw e retorna o caminho escolhido pelo usuário via input."""
     arquivos = sorted(p for p in diretorio_raw.iterdir() if p.is_file())

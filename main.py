@@ -15,6 +15,8 @@ from src.utils import (
     classify_similarity,
     carregar_dicionario_sinonimos,
     calcular_matriz_similaridade_ponderada,
+    carregar_falsos_amigos,
+    aplicar_penalidade_falsos_amigos,
 )
 
 # -----------------------------------------------------------------------------
@@ -27,6 +29,7 @@ DIR_PROCESSED = BASE_DIR / "data" / "03_processed"
 
 ARQUIVO_CPU = DIR_MASTER / "lista_cod_main.xlsx"
 ARQUIVO_DICIONARIO_SINONIMOS = DIR_MASTER / "dicionario_sinonimos" / "dicionario_sinonimo_1.0.xlsx"
+ARQUIVO_FALSOS_AMIGOS = DIR_MASTER / "falsos_amigos_candidatos.xlsx"
 
 
 # -----------------------------------------------------------------------------
@@ -38,6 +41,7 @@ def process_similarity_mapping(
     cliente_meta: dict,
     master_meta: dict,
     mapa_sinonimos: dict,
+    mapa_falsos_amigos: dict,
 ):
     """Compara descrições do cliente com a base master usando similaridade ponderada por sinônimos."""
     print("[INFO] Executando comparação por similaridade ponderada...")
@@ -62,6 +66,14 @@ def process_similarity_mapping(
 
         codigo_mestre = df_master.iloc[melhor_master_idx][master_meta["codigo_col"]]
         descricao_mestre = df_master.iloc[melhor_master_idx][master_meta["descricao_col"]]
+        descricao_mestre_normalizada = df_master.iloc[melhor_master_idx]["_descricao_normalizada"]
+
+        score = aplicar_penalidade_falsos_amigos(
+            df_cliente.at[pos_original, "_descricao_normalizada"],
+            descricao_mestre_normalizada,
+            mapa_falsos_amigos,
+            score,
+        )
 
         df_cliente.at[pos_original, cliente_meta["codigo_col"]] = codigo_mestre
         df_cliente.at[pos_original, "Descrição_Mestre_Encontrada"] = descricao_mestre
@@ -93,7 +105,12 @@ def carregar_bases_master_lista_cod(dir_master: Path) -> pd.DataFrame:
     return pd.concat(frames_master, ignore_index=True)
 
 
-def process_aux_similarity_mapping(df_cliente: pd.DataFrame, cliente_meta: dict, mapa_sinonimos: dict) -> pd.DataFrame:
+def process_aux_similarity_mapping(
+    df_cliente: pd.DataFrame,
+    cliente_meta: dict,
+    mapa_sinonimos: dict,
+    mapa_falsos_amigos: dict,
+) -> pd.DataFrame:
     """Reavalia itens com baixa similaridade/revisão recomendada buscando a melhor similaridade entre
     todos os arquivos 'lista_cod*' da pasta master de uma só vez (sem repassar arquivo por arquivo)."""
     print("[INFO] Executando busca complementar combinando todos os arquivos lista_cod* da pasta master...")
@@ -126,6 +143,14 @@ def process_aux_similarity_mapping(df_cliente: pd.DataFrame, cliente_meta: dict,
 
         codigo_encontrado = df_master_combinado.iloc[melhor_master_idx]["_codigo"]
         descricao_encontrada = df_master_combinado.iloc[melhor_master_idx]["_descricao"]
+        descricao_encontrada_normalizada = df_master_combinado.iloc[melhor_master_idx]["_descricao_normalizada"]
+
+        score = aplicar_penalidade_falsos_amigos(
+            df_cliente.at[pos_original, "_descricao_normalizada"],
+            descricao_encontrada_normalizada,
+            mapa_falsos_amigos,
+            score,
+        )
 
         df_cliente.at[pos_original, "Similaridade_Pct"] = round(score * 100, 2)
         df_cliente.at[pos_original, "Descrição_Mestre_Encontrada"] = descricao_encontrada
@@ -236,6 +261,7 @@ def main():
     print("\n=== INÍCIO DA AUTOMATIZAÇÃO ===")
     ensure_processed_dir(DIR_PROCESSED)
     mapa_sinonimos = carregar_dicionario_sinonimos(ARQUIVO_DICIONARIO_SINONIMOS)
+    mapa_falsos_amigos = carregar_falsos_amigos(ARQUIVO_FALSOS_AMIGOS)
 
     try:
         arquivo_cliente = selecionar_arquivo_cliente(DIR_RAW)
@@ -272,8 +298,8 @@ def main():
             df_cliente.at[idx, "Similaridade_Pct"] = 0.0
             df_cliente.at[idx, "Status_Automacao"] = "Agrupador / Cabeçalho"
 
-        df_cliente = process_similarity_mapping(df_cliente, df_master, cliente_meta, master_meta, mapa_sinonimos)
-        df_cliente = process_aux_similarity_mapping(df_cliente, cliente_meta, mapa_sinonimos)
+        df_cliente = process_similarity_mapping(df_cliente, df_master, cliente_meta, master_meta, mapa_sinonimos, mapa_falsos_amigos)
+        df_cliente = process_aux_similarity_mapping(df_cliente, cliente_meta, mapa_sinonimos, mapa_falsos_amigos)
 
         # Garantindo que linhas agrupadoras permaneçam com código vazio e sem busca executada.
         for idx in df_cliente.index[df_cliente["_is_agrupador"]]:
